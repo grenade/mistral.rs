@@ -6,7 +6,7 @@
 
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::Linear;
-use mistralrs_quant::{QuantMethod, QuantizedConfig, RowParallelLayer, ShardedVarBuilder};
+use mistralrs_quant::{QuantMethod, QuantizedConfig, RowParallelLayer, Shard, ShardedVarBuilder};
 use std::sync::Arc;
 
 use crate::device_map::DeviceMapper;
@@ -255,69 +255,116 @@ impl GatedDeltaNet {
             None
         };
 
-        let num_k_heads = cfg.linear_num_key_heads();
-        let num_v_heads = cfg.linear_num_value_heads();
+        let world_size = comm.world_size();
+        let rank = comm.rank();
+        let num_k_heads_full = cfg.linear_num_key_heads();
+        let num_v_heads_full = cfg.linear_num_value_heads();
+        if num_k_heads_full % world_size != 0 {
+            candle_core::bail!(
+                "GDN: linear_num_key_heads ({num_k_heads_full}) not divisible by tensor-parallel world_size ({world_size})"
+            );
+        }
+        if num_v_heads_full % world_size != 0 {
+            candle_core::bail!(
+                "GDN: linear_num_value_heads ({num_v_heads_full}) not divisible by tensor-parallel world_size ({world_size})"
+            );
+        }
+        let num_k_heads = num_k_heads_full / world_size;
+        let num_v_heads = num_v_heads_full / world_size;
         let head_k_dim = cfg.linear_key_head_dim();
         let head_v_dim = cfg.linear_value_head_dim();
+        let key_dim_full = num_k_heads_full * head_k_dim;
+        let value_dim_full = num_v_heads_full * head_v_dim;
         let key_dim = num_k_heads * head_k_dim;
         let value_dim = num_v_heads * head_v_dim;
         let conv_kernel_size = cfg.linear_conv_kernel_dim();
         let hidden_size = cfg.hidden_size();
-        let v_per_group = num_v_heads / num_k_heads;
+        // v_per_group is preserved under TP since num_k_heads and num_v_heads shrink by the same factor
+        let v_per_group = num_v_heads_full / num_k_heads_full;
 
         let vb_la = mapper.set_device(layer_idx, vb.pp("linear_attn"), loading_isq);
 
+        // Shard merged projections / conv / per-head state along dim 0 by head.
+        // The merged qkvz weight is laid out as num_k_heads_full * group_size_qkvz contiguous along dim 0,
+        // and the conv1d / dt_bias / A_log are along (key_dim*2 + value_dim) and num_v_heads_full respectively,
+        // so dim-0 sharding by world_size keeps each per-head block intact.
+        let head_shard = Shard::Simple {
+            dim: 0,
+            rank,
+            world_size,
+        };
+
         // Load qkvz and ba projections
-        let qkvz_out = key_dim * 2 + value_dim * 2;
+        let qkvz_out_full = key_dim_full * 2 + value_dim_full * 2;
         let mut qkvz_w = match weight_mode {
-            GdnWeightMode::MergedOnly => {
-                vb_la.get((qkvz_out, hidden_size), "in_proj_qkvz.weight")?
-            }
+            GdnWeightMode::MergedOnly => vb_la.get_with_hints(
+                (qkvz_out_full, hidden_size),
+                "in_proj_qkvz.weight",
+                head_shard,
+            )?,
             GdnWeightMode::MergedWithFallback => {
                 if vb_la.contains_tensor("in_proj_qkvz.weight") {
-                    vb_la.get((qkvz_out, hidden_size), "in_proj_qkvz.weight")?
+                    vb_la.get_with_hints(
+                        (qkvz_out_full, hidden_size),
+                        "in_proj_qkvz.weight",
+                        head_shard,
+                    )?
                 } else {
-                    // Load separate HF weights and interleave into grouped layout
-                    let qkv_w =
-                        vb_la.get((key_dim * 2 + value_dim, hidden_size), "in_proj_qkv.weight")?;
-                    let z_w = vb_la.get((value_dim, hidden_size), "in_proj_z.weight")?;
-                    let q_w = qkv_w.narrow(0, 0, key_dim)?;
-                    let k_w = qkv_w.narrow(0, key_dim, key_dim)?;
-                    let v_w = qkv_w.narrow(0, key_dim * 2, value_dim)?;
-                    let q_grouped = q_w.reshape((num_k_heads, head_k_dim, hidden_size))?;
-                    let k_grouped = k_w.reshape((num_k_heads, head_k_dim, hidden_size))?;
+                    // Load separate HF weights, interleave into grouped layout, then shard by head.
+                    let qkv_w = vb_la.get(
+                        (key_dim_full * 2 + value_dim_full, hidden_size),
+                        "in_proj_qkv.weight",
+                    )?;
+                    let z_w = vb_la.get((value_dim_full, hidden_size), "in_proj_z.weight")?;
+                    let q_w = qkv_w.narrow(0, 0, key_dim_full)?;
+                    let k_w = qkv_w.narrow(0, key_dim_full, key_dim_full)?;
+                    let v_w = qkv_w.narrow(0, key_dim_full * 2, value_dim_full)?;
+                    let q_grouped = q_w.reshape((num_k_heads_full, head_k_dim, hidden_size))?;
+                    let k_grouped = k_w.reshape((num_k_heads_full, head_k_dim, hidden_size))?;
                     let v_grouped =
-                        v_w.reshape((num_k_heads, v_per_group * head_v_dim, hidden_size))?;
+                        v_w.reshape((num_k_heads_full, v_per_group * head_v_dim, hidden_size))?;
                     let z_grouped =
-                        z_w.reshape((num_k_heads, v_per_group * head_v_dim, hidden_size))?;
+                        z_w.reshape((num_k_heads_full, v_per_group * head_v_dim, hidden_size))?;
                     let merged = Tensor::cat(&[q_grouped, k_grouped, v_grouped, z_grouped], 1)?;
-                    merged.reshape((qkvz_out, hidden_size))?
+                    let merged = merged.reshape((qkvz_out_full, hidden_size))?;
+                    head_shard.apply_to(&merged)?
                 }
             }
         };
 
         let mut ba_w = match weight_mode {
-            GdnWeightMode::MergedOnly => {
-                vb_la.get((num_v_heads * 2, hidden_size), "in_proj_ba.weight")?
-            }
+            GdnWeightMode::MergedOnly => vb_la.get_with_hints(
+                (num_v_heads_full * 2, hidden_size),
+                "in_proj_ba.weight",
+                head_shard,
+            )?,
             GdnWeightMode::MergedWithFallback => {
                 if vb_la.contains_tensor("in_proj_ba.weight") {
-                    vb_la.get((num_v_heads * 2, hidden_size), "in_proj_ba.weight")?
+                    vb_la.get_with_hints(
+                        (num_v_heads_full * 2, hidden_size),
+                        "in_proj_ba.weight",
+                        head_shard,
+                    )?
                 } else {
-                    let b_w = vb_la.get((num_v_heads, hidden_size), "in_proj_b.weight")?;
-                    let a_w = vb_la.get((num_v_heads, hidden_size), "in_proj_a.weight")?;
-                    let b_grouped = b_w.reshape((num_k_heads, v_per_group, hidden_size))?;
-                    let a_grouped = a_w.reshape((num_k_heads, v_per_group, hidden_size))?;
+                    let b_w = vb_la.get((num_v_heads_full, hidden_size), "in_proj_b.weight")?;
+                    let a_w = vb_la.get((num_v_heads_full, hidden_size), "in_proj_a.weight")?;
+                    let b_grouped = b_w.reshape((num_k_heads_full, v_per_group, hidden_size))?;
+                    let a_grouped = a_w.reshape((num_k_heads_full, v_per_group, hidden_size))?;
                     let merged = Tensor::cat(&[b_grouped, a_grouped], 1)?;
-                    merged.reshape((num_v_heads * 2, hidden_size))?
+                    let merged = merged.reshape((num_v_heads_full * 2, hidden_size))?;
+                    head_shard.apply_to(&merged)?
                 }
             }
         };
 
-        let conv_dim = key_dim * 2 + value_dim;
-        let mut conv1d_weight = vb_la.get((conv_dim, 1, conv_kernel_size), "conv1d.weight")?;
-        let mut dt_bias = vb_la.get(num_v_heads, "dt_bias")?;
-        let mut a_log = vb_la.get(num_v_heads, "A_log")?;
+        let conv_dim_full = key_dim_full * 2 + value_dim_full;
+        let mut conv1d_weight = vb_la.get_with_hints(
+            (conv_dim_full, 1, conv_kernel_size),
+            "conv1d.weight",
+            head_shard,
+        )?;
+        let mut dt_bias = vb_la.get_with_hints(num_v_heads_full, "dt_bias", head_shard)?;
+        let mut a_log = vb_la.get_with_hints(num_v_heads_full, "A_log", head_shard)?;
 
         if let Some(ref target_dev) = isq_target_device {
             qkvz_w = qkvz_w.to_device(target_dev)?;
@@ -337,8 +384,9 @@ impl GatedDeltaNet {
             isq_target_device.as_ref(),
         )?;
 
+        // RowParallelLayer shards its `in_dim` internally along dim=1, so pass the full value_dim.
         let out_proj = RowParallelLayer::new(
-            value_dim,
+            value_dim_full,
             hidden_size,
             cfg.quantization_config(),
             false,

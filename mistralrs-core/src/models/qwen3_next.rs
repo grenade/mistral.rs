@@ -821,14 +821,31 @@ impl Model {
             })
             .collect();
 
+        // GDN weights and recurrent state are sharded along the head dimension; the cache must
+        // match the per-rank layout produced by GatedDeltaNet::load.
+        let world_size = mapper.get_comm_for(0)?.world_size();
+        if cfg.linear_num_key_heads % world_size != 0 {
+            candle_core::bail!(
+                "GDN: linear_num_key_heads ({}) not divisible by tensor-parallel world_size ({})",
+                cfg.linear_num_key_heads,
+                world_size
+            );
+        }
+        if cfg.linear_num_value_heads % world_size != 0 {
+            candle_core::bail!(
+                "GDN: linear_num_value_heads ({}) not divisible by tensor-parallel world_size ({})",
+                cfg.linear_num_value_heads,
+                world_size
+            );
+        }
         let hybrid_cache_config = HybridCacheConfig {
             layer_types: pipeline_layer_types,
             max_seq_len: cfg.max_position_embeddings,
             recurrent: RecurrentLayerConfig {
-                conv_dim: cfg.linear_conv_dim(),
+                conv_dim: cfg.linear_conv_dim() / world_size,
                 conv_width: cfg.linear_conv_kernel_dim,
                 state_dims: vec![
-                    cfg.linear_num_value_heads,
+                    cfg.linear_num_value_heads / world_size,
                     cfg.linear_key_head_dim,
                     cfg.linear_value_head_dim,
                 ],
