@@ -357,12 +357,20 @@ impl GatedDeltaNet {
             }
         };
 
+        // conv1d.weight is laid out as three concatenated regions along dim 0:
+        // [Q channels (key_dim_full) | K channels (key_dim_full) | V channels (value_dim_full)],
+        // matching the mixed_qkv = cat([q, k, v_flat], -1) input shape. Each region is
+        // head-contiguous internally, but the regions themselves are not head-major. So a
+        // global dim-0 shard slices across region boundaries and breaks per-rank semantics.
+        // Slice each region by head separately and cat.
         let conv_dim_full = key_dim_full * 2 + value_dim_full;
-        let mut conv1d_weight = vb_la.get_with_hints(
-            (conv_dim_full, 1, conv_kernel_size),
-            "conv1d.weight",
-            head_shard,
-        )?;
+        let conv_w_full = vb_la.get((conv_dim_full, 1, conv_kernel_size), "conv1d.weight")?;
+        let key_per_rank = key_dim_full / world_size;
+        let val_per_rank = value_dim_full / world_size;
+        let conv_q = conv_w_full.narrow(0, rank * key_per_rank, key_per_rank)?;
+        let conv_k = conv_w_full.narrow(0, key_dim_full + rank * key_per_rank, key_per_rank)?;
+        let conv_v = conv_w_full.narrow(0, 2 * key_dim_full + rank * val_per_rank, val_per_rank)?;
+        let mut conv1d_weight = Tensor::cat(&[conv_q, conv_k, conv_v], 0)?.contiguous()?;
         let mut dt_bias = vb_la.get_with_hints(num_v_heads_full, "dt_bias", head_shard)?;
         let mut a_log = vb_la.get_with_hints(num_v_heads_full, "A_log", head_shard)?;
 
